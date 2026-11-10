@@ -14,6 +14,10 @@ Robloxのアセットを、Cloudflare R2にキャッシュして返すプロキ�
 
 管理ページでできること: 診断テスト(キー・接続元IP・Robloxの応答をそのまま表示)、キャッシュの有無確認、キャッシュ削除、R2使用量の確認。
 
+## エンドポイント `GET /user/{id}`
+
+Open Cloud(`GET /cloud/v2/users/{id}`)をAPIキーで呼び、`{ id, name, displayName }` を返します。結果はR2に1日キャッシュします(`X-Cache: HIT|MISS|BYPASS`)。公開API(`users.roblox.com`)の中継より、キー単位の枠(1000回/分)で動くので429になりにくいです。`/health` の `version` が 2 以上、`userApi: true` なら対応済みです。
+
 ## 429の見分け(応答の `source`)
 
 | source | 意味 |
@@ -38,6 +42,8 @@ Robloxへの問い合わせは、29のときWorker内で間隔を空けて3回�
 ### APIキーの作り方(Creator Hub)
 
 - 権限: `legacy-asset:manage`
+- 権限(追加): `user.advanced:read`(Users API の読み取り)。`GET /user/{id}`(表示名の取得)に使います。無くてもアバター読み込みは動きますが、表示名の代わりにIDが表示されます。
+- キーを作り直したら、Workerの `ROBLOX_API_KEY` を更新してください。
 - 許可IP: Workerの接続元はIPv6です。管理ページの診断テストの `egress.ip` を確認し、そのIP(例: `2a06:98c0:3600::103/128`)を許可してください。
 
 ## 注意

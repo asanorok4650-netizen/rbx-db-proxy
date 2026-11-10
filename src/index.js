@@ -2,13 +2,14 @@
 //
 //   GET  /asset/{id}   → R2にあればそれを返す(HIT)。無ければRobloxから取得し、R2に保存して返す(MISS)。
 //                        応答ヘッダー X-Cache: HIT | MISS | BYPASS(R2未設定)
+//   GET  /user/{id}    → Open Cloud(GET /cloud/v2/users/{id}, APIキー)で { id, name, displayName } を返す。R2に1日キャッシュ(X-Cache: HIT|MISS|BYPASS)
 //   GET|POST /?url=    → users / avatar の公開APIの中継(APIキーは付けない)。PROXY_RULES にあるものだけ
 //   GET  /health       → 接続確認(キーの値は返さない)
 //   GET  /             → 管理ページ(パスコードで診断・キャッシュ確認/削除・使用量)
 //   POST /admin        → 管理ページが呼ぶ。body: { passcode, action, assetId }
 //
 // 設定(Cloudflareダッシュボードの「ランタイム」側。ビルド側ではない):
-//   ROBLOX_API_KEY  (シークレット) Open CloudのAPIキー(権限: legacy-asset:manage)
+//   ROBLOX_API_KEY  (シークレット) Open CloudのAPIキー(権限: legacy-asset:manage、/user/{id}を使うなら users の user.advanced:read も)
 //   ADMIN_PASSCODE  (シークレット) 管理ページのパスコード(16文字以上推奨)
 //   CF_API_TOKEN    (シークレット・任意) 使用量表示用。権限: Account Analytics の読み取り
 //   ASSETS          (R2バインディング) wrangler.toml 参照。無いとキャッシュなしで動く
@@ -22,6 +23,7 @@
 // Robloxへの問い合わせは、429のときWorker内で間隔を空けてATTEMPTS回までやり直す。
 
 const ASSET_API = 'https://apis.roblox.com/asset-delivery-api/v1/assetId/';
+const USER_API = 'https://apis.roblox.com/cloud/v2/users/';
 const INTROSPECT_API = 'https://apis.roblox.com/api-keys/v1/introspect';
 const EGRESS_IP_API = 'https://api64.ipify.org?format=json';
 const GRAPHQL_API = 'https://api.cloudflare.com/client/v4/graphql';
@@ -29,6 +31,8 @@ const GRAPHQL_API = 'https://api.cloudflare.com/client/v4/graphql';
 // アセットの実体(Asset Deliveryが教えてくれるCDNのURL)として受け付けるホスト
 const CDN_HOSTS = [/(^|\.)roblox\.com$/, /(^|\.)rbxcdn\.com$/];
 const ASSET_PATH = /^\/asset\/(\d{1,19})$/;
+const USER_PATH = /^\/user\/(\d{1,19})$/;
+const USER_TTL_MS = 24 * 3600 * 1000;               // /user/{id} のR2キャッシュの有効期間(表示名は変わり得るので短め)
 
 // 汎用の中継(?url=)で転送してよいリクエスト
 const PROXY_RULES = [
@@ -45,6 +49,7 @@ const TEST_BODY_CHARS = 4000;
 
 // 同じアセットを同時に要求されてもRobloxへの問い合わせは1回にする(同じアイソレート内のみ)
 const inflight = new Map();
+const userInflight = new Map();
 
 const originList = (env) => String((env && env.ALLOWED_ORIGIN) || '*').split(',').map((s) => s.trim()).filter(Boolean);
 const restricted = (env) => { const l = originList(env); return l.length > 0 && !l.includes('*'); };
@@ -200,6 +205,74 @@ async function handleAsset(id, env, req, ctx, cors) {
     status: 200,
     headers: { ...cors, 'Content-Type': res.type, 'Cache-Control': 'public, max-age=86400', 'X-Cache': bucket ? 'MISS' : 'BYPASS' },
   });
+}
+
+// Open Cloud でユーザー情報(ユーザー名・表示名)を取得。キー無しの公開APIより429になりにくい(キー単位の枠 1000回/分)
+async function fetchUser(id, apiKey) {
+  try {
+    const m = await fetchRetry(USER_API + id, { headers: { 'x-api-key': apiKey, Accept: 'application/json' } });
+    if (m.limited) return fail(429, 'RATE_LIMITED', m.limited);
+    const r = m.r;
+    if (r.status === 401 || r.status === 403) return fail(401, 'KEY_REJECTED', { upstreamStatus: r.status });
+    if (r.status === 404) return fail(404, 'NOT_FOUND');
+    if (!r.ok) return fail(502, 'UPSTREAM', { upstreamStatus: r.status });
+    const j = await r.json();
+    const name = j && typeof j.name === 'string' ? j.name : '';
+    if (!name) return fail(502, 'NO_NAME');
+    const displayName = j && typeof j.displayName === 'string' && j.displayName ? j.displayName : name;
+    return { ok: true, body: JSON.stringify({ id: Number(id), name, displayName }) };
+  } catch (e) {
+    return fail(502, 'UPSTREAM');
+  }
+}
+
+async function handleUser(id, env, req, ctx, cors) {
+  const key = 'user/' + id;
+  const bucket = env && env.ASSETS;
+  const reply = (body, xcache) => new Response(body, {
+    status: 200,
+    headers: { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=3600', 'X-Cache': xcache },
+  });
+
+  // 1. R2に新しいものがあれば返す(Robloxを呼ばない)
+  if (bucket) {
+    try {
+      const obj = await bucket.get(key);
+      if (obj) {
+        const at = Number(obj.customMetadata && obj.customMetadata.fetchedAt) || 0;
+        if (Date.now() - at < USER_TTL_MS) return reply(await obj.text(), 'HIT');
+      }
+    } catch (e) { /* R2に失敗してもRobloxから取れるので続行 */ }
+  }
+
+  // 2. 無ければOpen Cloudから取得
+  const apiKey = apiKeyOf(env);
+  if (!apiKey) return json({ error: 'NO_API_KEY' }, 503, cors);
+  if (await limited(env.RL_UPSTREAM, clientKey(req))) return tooMany(cors, 'worker-upstream');
+
+  let p = userInflight.get(id);
+  if (!p) {
+    p = fetchUser(id, apiKey)
+      .then((res) => {
+        if (res.ok && bucket) {
+          ctx.waitUntil(
+            bucket.put(key, res.body, {
+              httpMetadata: { contentType: 'application/json' },
+              customMetadata: { fetchedAt: String(Date.now()) },
+            }).catch(() => {}),
+          );
+        }
+        return res;
+      })
+      .finally(() => userInflight.delete(id));
+    userInflight.set(id, p);
+  }
+  const res = await p;
+  if (!res.ok) {
+    if (res.status === 429) return tooMany(cors, res.source, res.retryAfter);
+    return json({ error: res.error, status: res.upstreamStatus }, res.status, cors);
+  }
+  return reply(res.body, bucket ? 'MISS' : 'BYPASS');
 }
 
 // users / avatar の公開APIの中継(APIキーは付けない。リダイレクトは追わない)
@@ -415,7 +488,7 @@ export default {
     if (url.pathname === '/health') {
       return json({
         ok: true, hasApiKey: Boolean(apiKeyOf(env)), hasCache: Boolean(env && env.ASSETS),
-        originRestricted: restricted(env), rateLimit: Boolean(env && env.RL_REQUEST && env.RL_UPSTREAM), version: 1,
+        originRestricted: restricted(env), rateLimit: Boolean(env && env.RL_REQUEST && env.RL_UPSTREAM), version: 2, userApi: true,
       }, 200, cors);
     }
     // 管理ページ(Origin制限・レート制限より前)。/ に ?url= が付いていれば従来どおり中継
@@ -427,6 +500,8 @@ export default {
 
     const m = ASSET_PATH.exec(url.pathname);
     if (m && req.method === 'GET') return handleAsset(m[1], env, req, ctx, cors);
+    const u = USER_PATH.exec(url.pathname);
+    if (u && req.method === 'GET') return handleUser(u[1], env, req, ctx, cors);
     return handleProxy(req, env, cors);
   },
 };

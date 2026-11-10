@@ -18,6 +18,13 @@ Robloxのアセットを、Cloudflare R2にキャッシュして返すプロキ�
 
 Open Cloud(`GET /cloud/v2/users/{id}`)をAPIキーで呼び、`{ id, name, displayName }` を返します。結果はR2に1日キャッシュします(`X-Cache: HIT|MISS|BYPASS`)。公開API(`users.roblox.com`)の中継より、キー単位の枠(1000回/分)で動くので429になりにくいです。`/health` の `version` が 2 以上、`userApi: true` なら対応済みです。
 
+## 管理ページのユーザー/アバター取得テスト
+
+管理ページ(`/`)の「ユーザー / アバター取得テスト」で、ユーザーID(数字)を入れて使います(パスコードが必要)。
+- **ユーザー情報(Open Cloud)を取得**: `/cloud/v2/users/{id}`(APIキー)と `users.roblox.com/v1/users/{id}`(公開API)を1回ずつ呼び、status・所要時間・応答を並べます。キーの権限(`user.advanced:read`)の確認にも使えます。
+- **アバター v1 と v4 を比較**: `avatar.roblox.com/v1/users/{id}/avatar`(非推奨)と `/v4/avatar/users/{id}` を1回ずつ呼び、違い(項目名・アセットの増減・`meta`の差・スケール・体色の項目)の要約と、それぞれの生JSONを返します。「結果をコピー」で全文をコピーできます。
+- 診断のため再試行しません(429が出たらそのまま見えます)。`?url=` の中継では `/v4/avatar/users/{id}` も許可しています。
+
 ## 429の見分け(応答の `source`)
 
 | source | 意味 |

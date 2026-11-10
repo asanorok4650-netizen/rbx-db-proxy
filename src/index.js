@@ -6,7 +6,8 @@
 //   GET|POST /?url=    → users / avatar の公開APIの中継(APIキーは付けない)。PROXY_RULES にあるものだけ
 //   GET  /health       → 接続確認(キーの値は返さない)
 //   GET  /             → 管理ページ(パスコードで診断・キャッシュ確認/削除・使用量)
-//   POST /admin        → 管理ページが呼ぶ。body: { passcode, action, assetId }
+//   POST /admin        → 管理ページが呼ぶ。body: { passcode, action, assetId | userId }
+//                        action: test | stat | purge | usage | user(Open Cloudのユーザー取得を診断) | avatar(v1とv4のアバター取得を比較)
 //
 // 設定(Cloudflareダッシュボードの「ランタイム」側。ビルド側ではない):
 //   ROBLOX_API_KEY  (シークレット) Open CloudのAPIキー(権限: legacy-asset:manage、/user/{id}を使うなら users の user.advanced:read も)
@@ -39,6 +40,7 @@ const PROXY_RULES = [
   { host: 'users.roblox.com', method: 'POST', path: /^\/v1\/usernames\/users$/ },
   { host: 'users.roblox.com', method: 'GET', path: /^\/v1\/users\/\d{1,19}$/ },
   { host: 'avatar.roblox.com', method: 'GET', path: /^\/v1\/users\/\d{1,19}\/avatar$/ },
+  { host: 'avatar.roblox.com', method: 'GET', path: /^\/v4\/avatar\/users\/\d{1,19}$/ },
 ];
 
 const MAX_BODY_BYTES = 16 * 1024;                  // 中継するPOSTの本文の上限
@@ -327,6 +329,11 @@ pre{padding:.6rem;border-radius:.4rem;background:#8882;white-space:pre-wrap;word
 <button id="stat">キャッシュされているか確認</button>
 <button id="purge">キャッシュを削除(次回取り直す)</button>
 <button id="usage">R2の使用量を確認</button>
+<h2>ユーザー / アバター取得テスト</h2>
+<input id="uid" type="text" inputmode="numeric" placeholder="ユーザーID(数字)">
+<button id="utest">ユーザー情報(Open Cloud)を取得</button>
+<button id="avcmp">アバター v1 と v4 を比較</button>
+<button id="copy">結果をコピー</button>
 <pre id="out" hidden></pre>
 <p><small>診断テストはRobloxを直接呼び、APIキーの枠を消費します(R2には保存しません)。キャッシュ確認はR2の読み取り操作を1回使います。</small></p>
 <script>
@@ -348,6 +355,16 @@ $('test').onclick=()=>call('test');
 $('stat').onclick=()=>call('stat');
 $('purge').onclick=()=>call('purge');
 $('usage').onclick=()=>call('usage');
+async function callUser(action){
+  const o=$('out');o.hidden=false;o.textContent='送信中…';
+  try{
+    const r=await fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({passcode:$('pw').value,action:action,userId:$('uid').value})});
+    o.textContent=JSON.stringify(await r.json(),null,2);
+  }catch(e){o.textContent='通信に失敗しました';}
+}
+$('utest').onclick=()=>callUser('user');
+$('avcmp').onclick=()=>callUser('avatar');
+$('copy').onclick=async()=>{try{await navigator.clipboard.writeText($('out').textContent);$('copy').textContent='コピーしました';}catch(e){$('copy').textContent='コピーできませんでした(長押しで選択してください)';}setTimeout(()=>{$('copy').textContent='結果をコピー';},2000);};
 refresh();
 </script></body></html>`;
 
@@ -392,6 +409,90 @@ async function runTest(env, rawId) {
     r.headers.forEach((v, k) => { if (k !== 'set-cookie') headers[k] = v; });
     out.asset = { ok: r.ok, status: r.status, statusText: r.statusText, ms: Date.now() - t0, headers, body: text.slice(0, TEST_BODY_CHARS), truncated: text.length > TEST_BODY_CHARS };
   } catch (e) { out.asset = { error: 'FETCH_FAILED' }; }
+  return adminJson(out, 200);
+}
+
+// 1回だけ呼んで、状態・所要時間・一部ヘッダ・本文をそのまま返す(診断用。再試行しない)
+async function probe(url, init) {
+  const t0 = Date.now();
+  try {
+    const r = await fetch(url, init);
+    const text = await r.text();
+    const headers = {};
+    ['content-type', 'retry-after', 'x-ratelimit-remaining', 'x-ratelimit-reset', 'cf-ray'].forEach((k) => { const v = r.headers.get(k); if (v) headers[k] = v; });
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) { /* JSONでない */ }
+    return { ok: r.ok, status: r.status, ms: Date.now() - t0, headers, json, body: json === null ? text.slice(0, TEST_BODY_CHARS) : undefined };
+  } catch (e) {
+    return { error: 'FETCH_FAILED' };
+  }
+}
+
+const keysOf = (o) => (o && typeof o === 'object' && !Array.isArray(o) ? Object.keys(o).sort() : []);
+const diffKeys = (a, b) => ({
+  both: keysOf(a).filter((k) => keysOf(b).includes(k)),
+  onlyV1: keysOf(a).filter((k) => !keysOf(b).includes(k)),
+  onlyV4: keysOf(b).filter((k) => !keysOf(a).includes(k)),
+});
+const unionKeys = (list) => Array.from(new Set(list.flatMap((x) => keysOf(x)))).sort();
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// v1 と v4 のレスポンスの違いを要約する(エンジンが読む項目を中心に)
+function compareAvatar(a, b) {
+  const as1 = Array.isArray(a && a.assets) ? a.assets : [], as4 = Array.isArray(b && b.assets) ? b.assets : [];
+  const ids1 = as1.map((x) => x && x.id), ids4 = as4.map((x) => x && x.id);
+  const metaOf = (x) => (x && x.meta) || null;
+  const byId4 = new Map(as4.map((x) => [x && x.id, x]));
+  const metaDiff = as1
+    .filter((x) => byId4.has(x && x.id) && !same(metaOf(x), metaOf(byId4.get(x.id))))
+    .map((x) => ({ id: x.id, name: x.name, v1: metaOf(x), v4: metaOf(byId4.get(x.id)) }));
+  return {
+    topLevelKeys: diffKeys(a, b),
+    playerAvatarType: { v1: a && a.playerAvatarType, v4: b && b.playerAvatarType, same: (a && a.playerAvatarType) === (b && b.playerAvatarType) },
+    scales: { v1: a && a.scales, v4: b && b.scales, same: same(a && a.scales, b && b.scales) },
+    bodyColors: {
+      v1Keys: keysOf(a && (a.bodyColors || a.bodyColor3s)), v4Keys: keysOf(b && (b.bodyColors || b.bodyColor3s)),
+      v1Field: a && (a.bodyColors ? 'bodyColors' : a.bodyColor3s ? 'bodyColor3s' : null), v4Field: b && (b.bodyColors ? 'bodyColors' : b.bodyColor3s ? 'bodyColor3s' : null),
+      same: same(a && (a.bodyColors || a.bodyColor3s), b && (b.bodyColors || b.bodyColor3s)),
+    },
+    assets: {
+      countV1: as1.length, countV4: as4.length,
+      onlyV1: as1.filter((x) => !ids4.includes(x && x.id)).map((x) => ({ id: x.id, name: x.name })),
+      onlyV4: as4.filter((x) => !ids1.includes(x && x.id)).map((x) => ({ id: x.id, name: x.name })),
+      fieldKeysV1: unionKeys(as1), fieldKeysV4: unionKeys(as4),
+      withMetaV1: as1.filter((x) => metaOf(x)).length, withMetaV4: as4.filter((x) => metaOf(x)).length,
+      assetTypeKeysV1: unionKeys(as1.map((x) => x && x.assetType)), assetTypeKeysV4: unionKeys(as4.map((x) => x && x.assetType)),
+      metaDifferences: metaDiff,
+    },
+  };
+}
+
+// ユーザー情報の診断: Open Cloud(キー付き)と、公開API(users.roblox.com)の応答を並べる
+async function runUserTest(env, rawId) {
+  const id = String(rawId || '').trim();
+  if (!/^\d{1,19}$/.test(id)) return adminJson({ error: 'BAD_USER_ID' }, 400);
+  const key = apiKeyOf(env);
+  const out = { userId: id };
+  out.openCloud = key
+    ? await probe(USER_API + id, { headers: { 'x-api-key': key, Accept: 'application/json' } })
+    : { error: 'NO_API_KEY' };
+  out.publicApi = await probe('https://users.roblox.com/v1/users/' + id, { headers: { Accept: 'application/json' } });
+  return adminJson(out, 200);
+}
+
+// アバター取得の比較: v1(非推奨)と v4 を同じユーザーで1回ずつ呼び、違いを要約して生のJSONも返す
+async function runAvatarCompare(rawId) {
+  const id = String(rawId || '').trim();
+  if (!/^\d{1,19}$/.test(id)) return adminJson({ error: 'BAD_USER_ID' }, 400);
+  const init = { headers: { Accept: 'application/json' } };
+  const v1 = await probe('https://avatar.roblox.com/v1/users/' + id + '/avatar', init);
+  const v4 = await probe('https://avatar.roblox.com/v4/avatar/users/' + id, init);
+  const out = { userId: id };
+  out.summary = v1.json && v4.json
+    ? compareAvatar(v1.json, v4.json)
+    : { note: '片方または両方のJSONが取れませんでした(statusを確認)', v1Status: v1.status, v4Status: v4.status };
+  out.v1 = v1;
+  out.v4 = v4;
   return adminJson(out, 200);
 }
 
@@ -460,6 +561,8 @@ async function handleAdmin(req, env) {
 
   if (b.action === 'test') return runTest(env, b.assetId);
   if (b.action === 'usage') return runUsage(env);
+  if (b.action === 'user') return runUserTest(env, b.userId);
+  if (b.action === 'avatar') return runAvatarCompare(b.userId);
 
   if (b.action === 'stat' || b.action === 'purge') {
     const id = String(b.assetId || '').trim();

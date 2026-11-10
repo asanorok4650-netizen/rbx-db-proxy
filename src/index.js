@@ -488,8 +488,10 @@ async function runAvatarCompare(rawId) {
   const v1 = await probe('https://avatar.roblox.com/v1/users/' + id + '/avatar', init);
   const v4 = await probe('https://avatar.roblox.com/v4/avatar/users/' + id, init);
   const out = { userId: id };
+  // v4は { avatarModel, avatarConfigurations } に包まれているので、中身を取り出して v1 と同じ階層で比べる
+  const m4 = v4.json && v4.json.avatarModel && typeof v4.json.avatarModel === 'object' ? v4.json.avatarModel : null;
   out.summary = v1.json && v4.json
-    ? compareAvatar(v1.json, v4.json)
+    ? { ...compareAvatar(v1.json, m4 || v4.json), v4Wrapper: m4 ? { unwrapped: 'avatarModel', otherTopLevelKeys: keysOf(v4.json).filter((k) => k !== 'avatarModel') } : null }
     : { note: '片方または両方のJSONが取れませんでした(statusを確認)', v1Status: v1.status, v4Status: v4.status };
   out.v1 = v1;
   out.v4 = v4;

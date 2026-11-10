@@ -1,0 +1,40 @@
+name = "rbx-db-proxy"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+# このプロキシを使ってよいサイトのOrigin(カンマ区切りで複数可。末尾の / やパスは付けない)。
+# ダッシュボードで設定した変数は、deployのたびにここの値で置き換わるので、変更はこのファイルで行う。
+ALLOWED_ORIGIN = "https://thegameserver.pages.dev, http://127.0.0.1:8000"
+
+# 1アセットのサイズ上限(バイト)。超えたものは返さない。省略時は 33554432 (32MB)。
+MAX_OBJECT_BYTES = "33554432"
+
+# 使用量表示用(任意)。CF_ACCOUNT_ID はCloudflareのアカウントID(秘密ではない)。
+CF_ACCOUNT_ID = ""
+R2_BUCKET_NAME = "rbx-assets"
+
+# シークレット(ダッシュボードの「変数とシークレット」のランタイム側で、種類をシークレットにして設定。ここには書かない):
+#   ROBLOX_API_KEY, ADMIN_PASSCODE, CF_API_TOKEN(任意)
+
+# アセットを保存するR2バケット。先にダッシュボードの R2 で同じ名前のバケットを作っておくこと(無いとdeployが失敗する)。
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "rbx-assets"
+
+# レート制限(Wrangler 4.36.0以降)。IPごと・Cloudflareの拠点ごとの近似値で、period は 10 か 60(秒)のみ。
+# namespace_id はアカウント内で重複しない正の整数の文字列(旧Workerは 3101/3102 を使用)。
+# 同じ学校・会社・携帯回線(NAT)の人は枠を共有するので、厳しくしすぎない。
+[[ratelimits]]
+name = "RL_REQUEST"   # 全リクエスト(R2から返すものも含む)
+namespace_id = "3201"
+  [ratelimits.simple]
+  limit = 600
+  period = 60
+
+[[ratelimits]]
+name = "RL_UPSTREAM"  # Robloxを実際に呼ぶもの(R2に無いアセット・users/avatar API)
+namespace_id = "3202"
+  [ratelimits.simple]
+  limit = 100
+  period = 60

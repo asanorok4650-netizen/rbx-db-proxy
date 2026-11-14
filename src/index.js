@@ -8,7 +8,7 @@
 //   GET  /             → 管理ページ(パスコードで診断・キャッシュ確認/削除・使用量)
 //   POST /admin        → 管理ページが呼ぶ。body: { passcode, action, assetId | userId }
 //                        action: test | stat | purge | usage | user(Open Cloudのユーザー取得を診断) | avatar(v1とv4のアバター取得を比較)
-//                                cache(1アセットをRobloxから取得してR2に保存。force:trueで取り直し) | avatarCache(アバター情報をR2のavatar/{id}に保存しアセット一覧を返す)
+//                                cache(1アセットをRobloxから取得してR2に保存。force:trueで取り直し) | avatarCache(アバター情報をR2のavatar/{id}に保存しアセット一覧を返す。skip:[カテゴリ]で除外) | sweep(R2のasset/を種別で探索。dryRun:falseで削除。categories:[animation|layered])
 //
 // 設定(Cloudflareダッシュボードの「ランタイム」側。ビルド側ではない):
 //   ROBLOX_API_KEY  (シークレット) Open CloudのAPIキー(権限: legacy-asset:manage、/user/{id}を使うなら users の user.advanced:read も)
@@ -350,6 +350,12 @@ pre{padding:.6rem;border-radius:.4rem;background:#8882;white-space:pre-wrap;word
 <button id="cache">アセットを取得してR2に保存</button>
 <button id="avcache">アバターを取得して、含まれるアセットごとR2に保存</button>
 <label><input id="force" type="checkbox" style="width:auto"> 既にR2にあっても取り直す</label>
+<h2>除外カテゴリ / 不要物の削除</h2>
+<label><input id="cat_animation" type="checkbox" style="width:auto" checked> アニメーション・エモート</label><br>
+<label><input id="cat_layered" type="checkbox" style="width:auto" checked> レイヤー服</label>
+<p><small>チェックしたカテゴリは、アバター一括保存では保存しません。下のボタンは、R2に保存済みのうちそのカテゴリのものを探します。</small></p>
+<button id="sweepdry">R2を探索して不要物を一覧(削除はしない)</button>
+<button id="sweepdel" hidden>見つかった不要物を削除</button>
 <button id="cancel" hidden>中止</button>
 <p><small>失敗(429・Robloxの5xx・通信エラー)は自動でやり直します(1件につき最大5回、間隔を空けて)。アバターのIDは上の「ユーザーID」欄を使います。</small></p>
 <button id="copy">結果をコピー</button>
@@ -433,10 +439,12 @@ async function runCache(avatar){
     if(avatar){
       const uid=$('uid').value.trim();
       lines.push('アバター取得中… (ユーザー '+uid+')');render();
-      const a=await adminCall({action:'avatarCache',userId:uid},'アバター',(m)=>{lines.push('  '+m);render();});
+      const a=await adminCall({action:'avatarCache',userId:uid,skip:skipList()},'アバター',(m)=>{lines.push('  '+m);render();});
       if(!a.ok){lines.push('✗ '+(a.error||'失敗'));render();return;}
       ids=a.assets.map((x)=>x.id);
-      lines.push('アバター情報をR2に保存('+a.api+')。アセット '+ids.length+' 件を保存します');render();
+      lines.push('アバター情報をR2に保存('+a.api+')。アセット '+ids.length+' 件を保存します');
+      (a.skipped||[]).forEach((x)=>lines.push('  除外: '+x.id+' '+x.type+' '+x.name+' ['+x.category+']'));
+      render();
     }else{
       ids=Array.from(new Set($('cids').value.split(/[^0-9]+/).filter(Boolean)));
       if(!ids.length){lines.push('アセットIDを入力してください');render();return;}
@@ -445,6 +453,36 @@ async function runCache(avatar){
   }catch(e){lines.push('エラー: '+e);render();}
   finally{$('cancel').hidden=true;}
 }
+const skipList=()=>['animation','layered'].filter((k)=>$('cat_'+k).checked);
+// R2のasset/を30件ずつ調べる。dry=trueは一覧だけ、falseは見つかったものを削除
+async function runSweep(dry){
+  const cats=skipList();
+  const o=$('out');o.hidden=false;
+  if(!cats.length){o.textContent='カテゴリを1つ以上チェックしてください';return;}
+  if(!dry&&!confirm('見つかった不要物をR2から削除します。よろしいですか?'))return;
+  cancelled=false;$('cancel').hidden=false;$('sweepdel').hidden=true;
+  const lines=[];const render=()=>{o.textContent=lines.join('\\n');};
+  let cursor=null,scanned=0,found=0,unknown=0,deleted=0,bytes=0,ok=true;
+  try{
+    for(let page=1;;page++){
+      if(cancelled){lines.push('— 中止しました');ok=false;break;}
+      const j=await adminCall({action:'sweep',categories:cats,cursor:cursor,dryRun:dry},'探索 '+page,(m)=>{lines.push('  '+m);render();});
+      if(!j.ok){lines.push('✗ '+(j.error||'失敗')+'(ここで止めました。もう一度押すと最初から調べ直します)');ok=false;break;}
+      scanned+=j.scanned;unknown+=j.unknown.length;deleted+=j.deleted;
+      j.matched.forEach((m)=>{found++;bytes+=m.size;lines.push((dry?'候補 ':'削除 ')+m.id+' ['+m.category+'] '+Math.round(m.size/1024)+'KB');});
+      lines.push('… '+scanned+' 件調査済み');render();
+      if(j.done)break;
+      cursor=j.cursor;
+    }
+  }catch(e){lines.push('エラー: '+e);ok=false;}
+  lines.push('');
+  lines.push((dry?'候補 ':'削除 ')+found+' 件('+Math.round(bytes/1024)+'KB) / 調査 '+scanned+' 件 / 種別不明 '+unknown+' 件(不明は削除しません)');
+  render();
+  $('cancel').hidden=true;
+  if(dry&&ok&&found>0)$('sweepdel').hidden=false;
+}
+$('sweepdry').onclick=()=>runSweep(true);
+$('sweepdel').onclick=()=>runSweep(false);
 $('cache').onclick=()=>runCache(false);
 $('avcache').onclick=()=>runCache(true);
 $('cancel').onclick=()=>{cancelled=true;};
@@ -619,6 +657,89 @@ async function runCacheAsset(env, rawId, force) {
   return adminJson({ ok: true, id, result: force ? 'refreshed' : 'cached', size: res.buf.byteLength, contentType: res.type }, 200);
 }
 
+// ---- カテゴリ除外 / 不要物の探索・削除 ----
+// アセットの種別(AssetTypeId)でカテゴリを判定する。名前(例: RunAnimation)でも判定できる。
+const CATEGORIES = {
+  animation: { label: 'アニメーション・エモート', ids: [24, 48, 49, 50, 51, 52, 53, 54, 55, 56, 61], name: /Animation$/ },
+  layered: { label: 'レイヤー服', ids: [64, 65, 66, 67, 68, 69, 70, 71, 72], name: /^(TShirt|Shirt|Pants|Jacket|Sweater|Shorts|LeftShoe|RightShoe|DressSkirt)Accessory$/ },
+};
+const TYPE_INDEX_KEY = 'index/asset-types.json'; // { "<assetId>": <assetTypeId>(0=不明) }。種別は変わらないので一度調べたら再取得しない
+const ECONOMY_DETAILS_API = 'https://economy.roblox.com/v2/assets/';
+const SWEEP_PAGE = 30; // 1回の探索で調べる件数(種別の問い合わせが外部subrequestの上限に当たらない数)
+
+function categoryOf(typeId, typeName) {
+  for (const [key, c] of Object.entries(CATEGORIES)) {
+    if (c.ids.includes(Number(typeId)) || (typeName && c.name.test(typeName))) return key;
+  }
+  return null;
+}
+const validCategories = (v) => (Array.isArray(v) ? v.filter((k) => Object.prototype.hasOwnProperty.call(CATEGORIES, k)) : []);
+
+async function loadTypes(env) {
+  try {
+    const o = await env.ASSETS.get(TYPE_INDEX_KEY);
+    if (!o) return {};
+    const j = JSON.parse(await o.text());
+    return j && typeof j === 'object' ? j : {};
+  } catch (e) { return {}; }
+}
+const saveTypes = (env, types) =>
+  env.ASSETS.put(TYPE_INDEX_KEY, JSON.stringify(types), { httpMetadata: { contentType: 'application/json' } });
+
+// 種別が分からないアセットを公開APIで調べる。戻り値: { ok: true, typeId } | { ok: false, res }
+async function lookupAssetType(id) {
+  try {
+    const m = await fetchRetry(ECONOMY_DETAILS_API + id + '/details', { headers: { Accept: 'application/json' } });
+    if (m.limited) return { ok: false, res: fail(429, 'RATE_LIMITED', m.limited) };
+    if (!m.r.ok) return { ok: false, res: fail(m.r.status === 404 ? 404 : 502, m.r.status === 404 ? 'NOT_FOUND' : 'UPSTREAM', { upstreamStatus: m.r.status }) };
+    const j = await m.r.json();
+    const t = Number(j && (j.AssetTypeId != null ? j.AssetTypeId : j.assetTypeId));
+    return Number.isFinite(t) && t > 0 ? { ok: true, typeId: t } : { ok: false, res: fail(502, 'NO_TYPE') };
+  } catch (e) {
+    return { ok: false, res: fail(502, 'UPSTREAM') };
+  }
+}
+
+// R2の asset/ を30件ずつ調べ、選んだカテゴリのものを返す(dryRun でなければ削除もする)。cursor で続きから。
+async function runSweep(env, b) {
+  const cats = validCategories(b.categories);
+  if (!cats.length) return adminJson({ ok: false, error: 'NO_CATEGORY' }, 400);
+  if (!env.ASSETS) return adminJson({ ok: false, error: 'NO_R2_BINDING' }, 503);
+  let l;
+  try {
+    l = await env.ASSETS.list({ prefix: 'asset/', limit: SWEEP_PAGE, cursor: typeof b.cursor === 'string' && b.cursor ? b.cursor : undefined });
+  } catch (e) { return adminJson({ ok: false, error: 'R2_ERROR', retryable: true }, 500); }
+
+  const types = await loadTypes(env);
+  let dirty = false, stop = null;
+  const matched = [], unknown = [];
+  for (const o of l.objects) {
+    const id = o.key.slice('asset/'.length);
+    let t = types[id];
+    if (t === undefined) {
+      const r = await lookupAssetType(id);
+      if (r.ok) { t = r.typeId; }
+      else if (retryableFail(r.res)) { stop = r.res; break; }   // 続きは同じcursorでやり直す(調べ済みの分は保存される)
+      else { t = 0; }                                            // 調べられない(削除済み等)は「不明」として残す
+      types[id] = t; dirty = true;
+    }
+    const cat = t ? categoryOf(t, '') : null;
+    if (!t) unknown.push(id);
+    else if (cat && cats.includes(cat)) matched.push({ id, size: o.size, category: cat });
+  }
+  if (dirty) { try { await saveTypes(env, types); } catch (e) { /* 次回また調べるだけ */ } }
+  if (stop) return failJson(stop);
+
+  if (!b.dryRun && matched.length) {
+    try { await env.ASSETS.delete(matched.map((m) => 'asset/' + m.id)); }
+    catch (e) { return adminJson({ ok: false, error: 'R2_ERROR', retryable: true }, 500); }
+  }
+  return adminJson({
+    ok: true, scanned: l.objects.length, matched, unknown, deleted: b.dryRun ? 0 : matched.length,
+    cursor: l.truncated ? l.cursor : null, done: !l.truncated,
+  }, 200);
+}
+
 // アバター情報を取得(v4 → だめなら v1。どちらも429/5xxはfetchRetryでやり直す)。戻り値: { ok, ver, text, assets }
 async function fetchAvatar(id) {
   let err = fail(502, 'UPSTREAM');
@@ -638,7 +759,8 @@ async function fetchAvatar(id) {
         const aid = a && a.id != null ? String(a.id) : '';
         if (!/^\d{1,19}$/.test(aid) || seen.has(aid)) continue;
         seen.add(aid);
-        assets.push({ id: aid, name: (a && a.name) || '', type: (a && a.assetType && a.assetType.name) || '' });
+        const at = a && a.assetType;
+        assets.push({ id: aid, name: (a && a.name) || '', type: (at && at.name) || '', typeId: at && Number(at.id) > 0 ? Number(at.id) : 0 });
       }
       return { ok: true, ver, text, assets };
     } catch (e) {
@@ -649,7 +771,7 @@ async function fetchAvatar(id) {
 }
 
 // アバター情報を取得して R2 (avatar/{userId}) に保存し、含まれるアセット一覧を返す(アセット本体の保存は管理ページが続けて行う)
-async function runAvatarCache(env, rawId) {
+async function runAvatarCache(env, rawId, rawSkip) {
   const id = String(rawId || '').trim();
   if (!/^\d{1,19}$/.test(id)) return adminJson({ ok: false, error: 'BAD_USER_ID' }, 400);
   if (!env.ASSETS) return adminJson({ ok: false, error: 'NO_R2_BINDING' }, 503);
@@ -660,7 +782,19 @@ async function runAvatarCache(env, rawId) {
   } catch (e) {
     return adminJson({ ok: false, error: 'R2_ERROR', retryable: true }, 500);
   }
-  return adminJson({ ok: true, userId: id, api: res.ver, savedKey: 'avatar/' + id, assets: res.assets }, 200);
+  // 種別を覚えておく(後の探索で再問い合わせしないため)。skip で選んだカテゴリは保存対象から外す
+  const skip = validCategories(rawSkip);
+  const assets = [], skipped = [];
+  const types = await loadTypes(env);
+  let dirty = false;
+  for (const a of res.assets) {
+    if (a.typeId && types[a.id] !== a.typeId) { types[a.id] = a.typeId; dirty = true; }
+    const cat = categoryOf(a.typeId, a.type);
+    if (cat && skip.includes(cat)) skipped.push({ id: a.id, name: a.name, type: a.type, category: cat });
+    else assets.push(a);
+  }
+  if (dirty) { try { await saveTypes(env, types); } catch (e) { /* 無視 */ } }
+  return adminJson({ ok: true, userId: id, api: res.ver, savedKey: 'avatar/' + id, assets, skipped }, 200);
 }
 
 // R2の使用量(GraphQL Analytics API)。保存量は直近3日の最新値、操作回数は今月(UTC)の合計
@@ -716,7 +850,7 @@ async function handleAdmin(req, env) {
     });
   }
   if (!env || !env.ADMIN_PASSCODE) return adminJson({ error: 'NO_PASSCODE_CONFIGURED' }, 503);
-  if (Number(req.headers.get('Content-Length')) > 1024) return adminJson({ error: 'TOO_LARGE' }, 413);
+  if (Number(req.headers.get('Content-Length')) > 8192) return adminJson({ error: 'TOO_LARGE' }, 413);
 
   let b;
   try { b = await req.json(); } catch (e) { b = {}; }
@@ -731,7 +865,8 @@ async function handleAdmin(req, env) {
   if (b.action === 'user') return runUserTest(env, b.userId);
   if (b.action === 'avatar') return runAvatarCompare(b.userId);
   if (b.action === 'cache') return runCacheAsset(env, b.assetId, b.force === true);
-  if (b.action === 'avatarCache') return runAvatarCache(env, b.userId);
+  if (b.action === 'avatarCache') return runAvatarCache(env, b.userId, b.skip);
+  if (b.action === 'sweep') return runSweep(env, b);
 
   if (b.action === 'stat' || b.action === 'purge') {
     const id = String(b.assetId || '').trim();

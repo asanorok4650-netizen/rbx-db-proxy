@@ -8,6 +8,7 @@
 //   GET  /             → 管理ページ(パスコードで診断・キャッシュ確認/削除・使用量)
 //   POST /admin        → 管理ページが呼ぶ。body: { passcode, action, assetId | userId }
 //                        action: test | stat | purge | usage | user(Open Cloudのユーザー取得を診断) | avatar(v1とv4のアバター取得を比較)
+//                                cache(1アセットをRobloxから取得してR2に保存。force:trueで取り直し) | avatarCache(アバター情報をR2のavatar/{id}に保存しアセット一覧を返す)
 //
 // 設定(Cloudflareダッシュボードの「ランタイム」側。ビルド側ではない):
 //   ROBLOX_API_KEY  (シークレット) Open CloudのAPIキー(権限: legacy-asset:manage、/user/{id}を使うなら users の user.advanced:read も)
@@ -104,16 +105,25 @@ async function classify429(r) {
 }
 
 function retryDelay(attempt, r) {
-  const ra = Number(r.headers.get('Retry-After'));
+  const ra = r ? Number(r.headers.get('Retry-After')) : NaN;
   if (Number.isFinite(ra) && ra > 0 && ra <= 3) return ra * 1000;
   return 400 * Math.pow(3, attempt) + Math.floor(Math.random() * 200);
 }
 
-// 429の間は間隔を空けてやり直す。戻り値: { r } または { limited: { source, retryAfter } }
+// 429・5xx・ネットワークエラーの間は間隔を空けてやり直す。戻り値: { r } または { limited: { source, retryAfter } }
+// (5xxが続いた場合は最後の応答を { r } で返す。ネットワークエラーが続いた場合は例外)
 async function fetchRetry(url, init) {
   let lim = null;
   for (let i = 0; i < ATTEMPTS; i++) {
-    const r = await fetch(url, init);
+    const last = i === ATTEMPTS - 1;
+    let r;
+    try { r = await fetch(url, init); }
+    catch (e) { if (last) throw e; await sleep(retryDelay(i)); continue; }
+    if (r.status >= 500 && r.status < 600 && !last) {
+      try { await r.body.cancel(); } catch (e) { /* 無視 */ }
+      await sleep(retryDelay(i));
+      continue;
+    }
     if (r.status !== 429) return { r };
     const source = await classify429(r);
     const ra = Number(r.headers.get('Retry-After'));
@@ -152,6 +162,8 @@ async function fetchAsset(id, apiKey, maxBytes) {
     return fail(502, 'UPSTREAM');
   }
 }
+
+const maxBytesOf = (env) => (Number(env && env.MAX_OBJECT_BYTES) > 0 ? Number(env.MAX_OBJECT_BYTES) : DEFAULT_MAX_OBJECT_BYTES);
 
 async function handleAsset(id, env, req, ctx, cors) {
   const key = 'asset/' + id;
@@ -333,6 +345,13 @@ pre{padding:.6rem;border-radius:.4rem;background:#8882;white-space:pre-wrap;word
 <input id="uid" type="text" inputmode="numeric" placeholder="ユーザーID(数字)">
 <button id="utest">ユーザー情報(Open Cloud)を取得</button>
 <button id="avcmp">アバター v1 と v4 を比較</button>
+<h2>Robloxから読み込んでR2に保存</h2>
+<input id="cids" type="text" placeholder="アセットID(複数ならカンマ・空白区切り)">
+<button id="cache">アセットを取得してR2に保存</button>
+<button id="avcache">アバターを取得して、含まれるアセットごとR2に保存</button>
+<label><input id="force" type="checkbox" style="width:auto"> 既にR2にあっても取り直す</label>
+<button id="cancel" hidden>中止</button>
+<p><small>失敗(429・Robloxの5xx・通信エラー)は自動でやり直します(1件につき最大5回、間隔を空けて)。アバターのIDは上の「ユーザーID」欄を使います。</small></p>
 <button id="copy">結果をコピー</button>
 <pre id="out" hidden></pre>
 <p><small>診断テストはRobloxを直接呼び、APIキーの枠を消費します(R2には保存しません)。キャッシュ確認はR2の読み取り操作を1回使います。</small></p>
@@ -364,6 +383,71 @@ async function callUser(action){
 }
 $('utest').onclick=()=>callUser('user');
 $('avcmp').onclick=()=>callUser('avatar');
+const sleepMs=(ms)=>new Promise((r)=>setTimeout(r,ms));
+const TRIES=5;
+let cancelled=false;
+// 失敗してもやり直す価値があれば(retryable・通信エラー)、間隔を空けて最大TRIES回まで呼ぶ
+async function adminCall(body,label,log){
+  body.passcode=$('pw').value;
+  let last={ok:false,error:'UNKNOWN'};
+  for(let i=0;i<TRIES;i++){
+    let wait=Math.min(1500*Math.pow(2,i),20000);
+    try{
+      const r=await fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j=await r.json().catch(()=>({ok:false,error:'BAD_RESPONSE'}));
+      if(r.ok&&j.ok!==false)return j;
+      last=j;
+      if(!j.retryable)return j;
+      if(j.retryAfter>0)wait=Math.min(j.retryAfter*1000,45000);
+    }catch(e){last={ok:false,error:'NETWORK',retryable:true};}
+    if(cancelled||i===TRIES-1)break;
+    log(label+' → '+(last.error||'失敗')+(last.source?'('+last.source+')':'')+'。'+Math.round(wait/1000)+'秒後に再試行 ('+(i+2)+'/'+TRIES+')');
+    await sleepMs(wait);
+  }
+  return last;
+}
+// IDを1件ずつ保存(順番に処理。429を避けるため並列にしない)
+async function cacheAssets(ids,force,lines,render){
+  let done=0,already=0,failed=[];
+  for(let n=0;n<ids.length;n++){
+    if(cancelled){lines.push('— 中止しました');break;}
+    const id=ids[n];
+    const head='['+(n+1)+'/'+ids.length+'] '+id;
+    const j=await adminCall({action:'cache',assetId:id,force:force},head,(m)=>{lines.push('  '+m);render();});
+    if(j.ok&&j.result==='already'){already++;lines.push(head+' = 既にR2にあり');}
+    else if(j.ok){done++;lines.push(head+' ✓ 保存 ('+Math.round(j.size/1024)+'KB)');}
+    else{failed.push(id);lines.push(head+' ✗ '+(j.error||'失敗')+(j.status?' ('+j.status+')':''));}
+    render();
+  }
+  lines.push('');
+  lines.push('完了: 保存 '+done+' / 既にあり '+already+' / 失敗 '+failed.length);
+  if(failed.length)lines.push('失敗したID: '+failed.join(', '));
+  render();
+}
+async function runCache(avatar){
+  const o=$('out');o.hidden=false;cancelled=false;$('cancel').hidden=false;
+  const lines=[];const render=()=>{o.textContent=lines.join('\\n');};
+  const force=$('force').checked;
+  try{
+    let ids;
+    if(avatar){
+      const uid=$('uid').value.trim();
+      lines.push('アバター取得中… (ユーザー '+uid+')');render();
+      const a=await adminCall({action:'avatarCache',userId:uid},'アバター',(m)=>{lines.push('  '+m);render();});
+      if(!a.ok){lines.push('✗ '+(a.error||'失敗'));render();return;}
+      ids=a.assets.map((x)=>x.id);
+      lines.push('アバター情報をR2に保存('+a.api+')。アセット '+ids.length+' 件を保存します');render();
+    }else{
+      ids=Array.from(new Set($('cids').value.split(/[^0-9]+/).filter(Boolean)));
+      if(!ids.length){lines.push('アセットIDを入力してください');render();return;}
+    }
+    await cacheAssets(ids,force,lines,render);
+  }catch(e){lines.push('エラー: '+e);render();}
+  finally{$('cancel').hidden=true;}
+}
+$('cache').onclick=()=>runCache(false);
+$('avcache').onclick=()=>runCache(true);
+$('cancel').onclick=()=>{cancelled=true;};
 $('copy').onclick=async()=>{try{await navigator.clipboard.writeText($('out').textContent);$('copy').textContent='コピーしました';}catch(e){$('copy').textContent='コピーできませんでした(長押しで選択してください)';}setTimeout(()=>{$('copy').textContent='結果をコピー';},2000);};
 refresh();
 </script></body></html>`;
@@ -498,6 +582,87 @@ async function runAvatarCompare(rawId) {
   return adminJson(out, 200);
 }
 
+// ---- 管理ページからのキャッシュ保存(アセット / アバター) ----
+// 管理ページ側が1アセットずつ呼び、失敗(retryable)は管理ページ側でも間隔を空けてやり直す。
+// 1リクエストで1アセットだけ処理するので、Workerのsubrequest数やCPU時間の上限に当たりにくい。
+
+// クライアントがやり直す価値のある失敗か(429・Roblox側5xx・通信エラー)。404/401/413などはやり直さない
+const retryableFail = (res) => res.status === 429
+  || ((res.error === 'UPSTREAM' || res.error === 'CDN') && !(res.upstreamStatus >= 400 && res.upstreamStatus < 500));
+const failJson = (res) => adminJson({
+  ok: false, error: res.error, status: res.upstreamStatus, source: res.source, retryAfter: res.retryAfter, retryable: retryableFail(res),
+}, res.status);
+
+// 1アセットをRobloxから取得してR2に保存(既にあれば force でなければ何もしない)
+async function runCacheAsset(env, rawId, force) {
+  const id = String(rawId || '').trim();
+  if (!/^\d{1,19}$/.test(id)) return adminJson({ ok: false, error: 'BAD_ASSET_ID' }, 400);
+  if (!env.ASSETS) return adminJson({ ok: false, error: 'NO_R2_BINDING' }, 503);
+  const key = 'asset/' + id;
+  if (!force) {
+    try {
+      const o = await env.ASSETS.head(key);
+      if (o) return adminJson({ ok: true, id, result: 'already', size: o.size }, 200);
+    } catch (e) { /* 確認に失敗しても取得は続ける */ }
+  }
+  const apiKey = apiKeyOf(env);
+  if (!apiKey) return adminJson({ ok: false, error: 'NO_API_KEY' }, 503);
+
+  const res = await fetchAsset(id, apiKey, maxBytesOf(env));
+  if (!res.ok) return failJson(res);
+  if (!res.storable) return adminJson({ ok: false, error: 'TOO_LARGE' }, 413);
+  try {
+    await env.ASSETS.put(key, res.buf, { httpMetadata: { contentType: res.type }, customMetadata: { fetchedAt: String(Date.now()) } });
+  } catch (e) {
+    return adminJson({ ok: false, error: 'R2_ERROR', retryable: true }, 500);
+  }
+  return adminJson({ ok: true, id, result: force ? 'refreshed' : 'cached', size: res.buf.byteLength, contentType: res.type }, 200);
+}
+
+// アバター情報を取得(v4 → だめなら v1。どちらも429/5xxはfetchRetryでやり直す)。戻り値: { ok, ver, text, assets }
+async function fetchAvatar(id) {
+  let err = fail(502, 'UPSTREAM');
+  for (const [ver, url] of [['v4', 'https://avatar.roblox.com/v4/avatar/users/' + id], ['v1', 'https://avatar.roblox.com/v1/users/' + id + '/avatar']]) {
+    try {
+      const m = await fetchRetry(url, { headers: { Accept: 'application/json' } });
+      if (m.limited) { err = fail(429, 'RATE_LIMITED', m.limited); continue; }
+      if (m.r.status === 404) { err = fail(404, 'NOT_FOUND'); continue; }
+      if (!m.r.ok) { err = fail(502, 'UPSTREAM', { upstreamStatus: m.r.status }); continue; }
+      const text = await m.r.text();
+      const j = JSON.parse(text);
+      const model = j && j.avatarModel && typeof j.avatarModel === 'object' ? j.avatarModel : j; // v4は avatarModel に包まれている
+      if (!model || !Array.isArray(model.assets)) { err = fail(502, 'NO_ASSETS'); continue; }
+      const seen = new Set();
+      const assets = [];
+      for (const a of model.assets) {
+        const aid = a && a.id != null ? String(a.id) : '';
+        if (!/^\d{1,19}$/.test(aid) || seen.has(aid)) continue;
+        seen.add(aid);
+        assets.push({ id: aid, name: (a && a.name) || '', type: (a && a.assetType && a.assetType.name) || '' });
+      }
+      return { ok: true, ver, text, assets };
+    } catch (e) {
+      err = fail(502, 'UPSTREAM');
+    }
+  }
+  return err;
+}
+
+// アバター情報を取得して R2 (avatar/{userId}) に保存し、含まれるアセット一覧を返す(アセット本体の保存は管理ページが続けて行う)
+async function runAvatarCache(env, rawId) {
+  const id = String(rawId || '').trim();
+  if (!/^\d{1,19}$/.test(id)) return adminJson({ ok: false, error: 'BAD_USER_ID' }, 400);
+  if (!env.ASSETS) return adminJson({ ok: false, error: 'NO_R2_BINDING' }, 503);
+  const res = await fetchAvatar(id);
+  if (!res.ok) return failJson(res);
+  try {
+    await env.ASSETS.put('avatar/' + id, res.text, { httpMetadata: { contentType: 'application/json' }, customMetadata: { fetchedAt: String(Date.now()), api: res.ver } });
+  } catch (e) {
+    return adminJson({ ok: false, error: 'R2_ERROR', retryable: true }, 500);
+  }
+  return adminJson({ ok: true, userId: id, api: res.ver, savedKey: 'avatar/' + id, assets: res.assets }, 200);
+}
+
 // R2の使用量(GraphQL Analytics API)。保存量は直近3日の最新値、操作回数は今月(UTC)の合計
 async function runUsage(env) {
   const token = env.CF_API_TOKEN, account = env.CF_ACCOUNT_ID, bucket = env.R2_BUCKET_NAME;
@@ -565,6 +730,8 @@ async function handleAdmin(req, env) {
   if (b.action === 'usage') return runUsage(env);
   if (b.action === 'user') return runUserTest(env, b.userId);
   if (b.action === 'avatar') return runAvatarCompare(b.userId);
+  if (b.action === 'cache') return runCacheAsset(env, b.assetId, b.force === true);
+  if (b.action === 'avatarCache') return runAvatarCache(env, b.userId);
 
   if (b.action === 'stat' || b.action === 'purge') {
     const id = String(b.assetId || '').trim();

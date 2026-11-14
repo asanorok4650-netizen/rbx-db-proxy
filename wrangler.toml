@@ -5,7 +5,7 @@ compatibility_date = "2026-10-01"
 [vars]
 # このプロキシを使ってよいサイトのOrigin(カンマ区切りで複数可。末尾の / やパスは付けない)。
 # ダッシュボードで設定した変数は、deployのたびにここの値で置き換わるので、変更はこのファイルで行う。
-ALLOWED_ORIGIN = "https://thegameserver.pages.dev, http://127.0.0.1:8000"
+ALLOWED_ORIGIN = "http://127.0.0.1:8080"
 
 # 1アセットのサイズ上限(バイト)。超えたものは返さない。省略時は 33554432 (32MB)。
 MAX_OBJECT_BYTES = "33554432"

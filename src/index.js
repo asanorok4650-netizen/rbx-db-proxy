@@ -3,7 +3,7 @@
 //   GET  /asset/{id}   → R2にあればそれを返す(HIT)。無ければRobloxから取得し、R2に保存して返す(MISS)。
 //                        応答ヘッダー X-Cache: HIT | MISS | BYPASS(R2未設定)
 //   GET  /user/{id}    → Open Cloud(GET /cloud/v2/users/{id}, APIキー)で { id, name, displayName } を返す。R2に1日キャッシュ(X-Cache: HIT|MISS|BYPASS)
-//   GET|POST /?url=    → users / avatar の公開APIの中継(APIキーは付けない)。PROXY_RULES にあるものだけ
+//   GET|POST /?url=    → users / avatar / catalog の公開APIの中継(APIキーは付けない)。PROXY_RULES にあるものだけ
 //   GET  /health       → 接続確認(キーの値は返さない)
 //   GET  /             → 管理ページ(パスコードで診断・キャッシュ確認/削除・使用量)
 //   POST /admin        → 管理ページが呼ぶ。body: { passcode, action, assetId | userId }
@@ -42,6 +42,10 @@ const PROXY_RULES = [
   { host: 'users.roblox.com', method: 'GET', path: /^\/v1\/users\/\d{1,19}$/ },
   { host: 'avatar.roblox.com', method: 'GET', path: /^\/v1\/users\/\d{1,19}\/avatar$/ },
   { host: 'avatar.roblox.com', method: 'GET', path: /^\/v4\/avatar\/users\/\d{1,19}$/ },
+  // ボディパーツ検索(RAE tools の searchBodyBundles / bundleAssetIds): カタログ検索・バンドル詳細・アウトフィット詳細(読み取りのみ)
+  { host: 'catalog.roblox.com', method: 'GET', path: /^\/v1\/search\/items\/details$/ },
+  { host: 'catalog.roblox.com', method: 'GET', path: /^\/v1\/bundles\/\d{1,19}\/details$/ },
+  { host: 'avatar.roblox.com', method: 'GET', path: /^\/v1\/outfits\/\d{1,19}\/details$/ },
 ];
 
 const MAX_BODY_BYTES = 16 * 1024;                  // 中継するPOSTの本文の上限
@@ -895,7 +899,7 @@ export default {
     if (url.pathname === '/health') {
       return json({
         ok: true, hasApiKey: Boolean(apiKeyOf(env)), hasCache: Boolean(env && env.ASSETS),
-        originRestricted: restricted(env), rateLimit: Boolean(env && env.RL_REQUEST && env.RL_UPSTREAM), version: 2, userApi: true,
+        originRestricted: restricted(env), rateLimit: Boolean(env && env.RL_REQUEST && env.RL_UPSTREAM), version: 3, userApi: true, catalog: true,
       }, 200, cors);
     }
     // 管理ページ(Origin制限・レート制限より前)。/ に ?url= が付いていれば従来どおり中継

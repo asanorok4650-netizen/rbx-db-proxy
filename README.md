@@ -8,7 +8,7 @@ Robloxのアセットを、Cloudflare R2にキャッシュして返すプロキ�
 | パス | 内容 |
 |---|---|
 | `GET /asset/{id}` | R2にあれば返す(`X-Cache: HIT`)。無ければRobloxから取得して保存し、返す(`MISS`)。R2未設定なら `BYPASS` |
-| `GET /?url=...` | users / avatar の公開APIの中継(キー無し。許可したものだけ) |
+| `GET /?url=...` | users / avatar / catalog の公開APIの中継(キー無し。許可したものだけ) |
 | `GET /health` | 接続確認 |
 | `GET /` | 管理ページ(パスコード式) |
 
@@ -24,6 +24,7 @@ Open Cloud(`GET /cloud/v2/users/{id}`)をAPIキーで呼び、`{ id, name, displ
 - **ユーザー情報(Open Cloud)を取得**: `/cloud/v2/users/{id}`(APIキー)と `users.roblox.com/v1/users/{id}`(公開API)を1回ずつ呼び、status・所要時間・応答を並べます。キーの権限(`user.advanced:read`)の確認にも使えます。
 - **アバター v1 と v4 を比較**: `avatar.roblox.com/v1/users/{id}/avatar`(非推奨)と `/v4/avatar/users/{id}` を1回ずつ呼び、違い(項目名・アセットの増減・`meta`の差・スケール・体色の項目)の要約と、それぞれの生JSONを返します。「結果をコピー」で全文をコピーできます。
 - 診断のため再試行しません(429が出たらそのまま見えます)。`?url=` の中継では `/v4/avatar/users/{id}` も許可しています。
+- **ボディパーツ検索用(version 3)**: `catalog.roblox.com` の `/v1/search/items/details`(カタログ検索)と `/v1/bundles/{id}/details`(バンドル詳細)、`avatar.roblox.com` の `/v1/outfits/{id}/details`(アウトフィット詳細)を GET のみ中継します。RAE BodyBuilder の「Roblox」タブの検索・バンドルID入力に必要です。`/health` に `catalog: true` が出れば対応済みです。
 
 ## 管理ページからのキャッシュ保存
 

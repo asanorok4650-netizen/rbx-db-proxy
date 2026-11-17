@@ -1,5 +1,5 @@
 name = "rbx-db-proxy"
-main = "src/index.js"
+main = "src/worker.js"
 compatibility_date = "2026-10-01"
 
 [vars]
@@ -18,6 +18,7 @@ R2_BUCKET_NAME = "rbx-assets"
 #   ROBLOX_API_KEY, ADMIN_PASSCODE, CF_API_TOKEN(任意)
 
 # アセットを保存するR2バケット。先にダッシュボードの R2 で同じ名前のバケットを作っておくこと(無いとdeployが失敗する)。
+# ログイン用のアカウント・セッションも、このバケットの auth/ 以下に保存する。
 [[r2_buckets]]
 binding = "ASSETS"
 bucket_name = "rbx-assets"
